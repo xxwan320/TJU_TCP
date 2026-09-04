@@ -11,7 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "global.h"
 #include <pthread.h>
 #include <sys/select.h>
 #include <arpa/inet.h>
@@ -29,7 +28,7 @@
 #define FALSE 0
 
 // 定义最大包长 防止IP层分片
-#define MAX_DLEN 1375 	// 最大包内数据长度
+#define MAX_DLEN 1380 	// 1400-byte packet minus the fixed 20-byte wire header
 #define MAX_LEN 1400 	// 最大包长度
 
 // TCP socket 状态定义
@@ -51,7 +50,7 @@
 #define FAST_RECOVERY 2
 
 // TCP 接受窗口大小
-#define TCP_RECVWN_SIZE 32*MAX_DLEN // 比如最多放32个满载数据包
+#define TCP_RECVWN_SIZE (5000*MAX_DLEN)
 
 // TCP 发送窗口
 // 注释的内容如果想用就可以用 不想用就删掉 仅仅提供思路和灵感
@@ -113,6 +112,7 @@ typedef struct {
 	pthread_cond_t wait_cond; // 可以被用来唤醒recv函数调用时等待的线程
 
 	window_t window; // 发送和接受窗口
+	void* internal; // protocol-private connection state
 
 } tju_tcp_t;
 

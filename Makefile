@@ -27,6 +27,18 @@ server: $(OBJS)
 client:
 	$(CC) $(FLAGS) ./src/client.c -o client $(OBJS) 
 
+verify: $(OBJS)
+	$(CC) $(FLAGS) ./verification/t1_wire_seq_test.c -o /tmp/tju_t1_wire_seq_test $(OBJS)
+	/tmp/tju_t1_wire_seq_test
+
+verify_apps: $(OBJS)
+	$(CC) $(FLAGS) ./verification/stream_client.c -o /tmp/tju_stream_client $(OBJS)
+	$(CC) $(FLAGS) ./verification/stream_server.c -o /tmp/tju_stream_server $(OBJS)
+	$(CC) $(FLAGS) ./verification/close_peer.c -o /tmp/tju_close_peer $(OBJS)
+	$(CC) $(FLAGS) ./verification/zero_window_client.c -o /tmp/tju_zero_window_client $(OBJS)
+	$(CC) $(FLAGS) ./verification/zero_window_server.c -o /tmp/tju_zero_window_server $(OBJS)
+	$(CC) -shared -fPIC ./verification/drop_sendto_once.c -o /tmp/tju_drop_sendto_once.so -ldl
+
 
 
 	

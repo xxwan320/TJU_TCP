@@ -1,0 +1,13 @@
+requirement,rfc_course,design,file_function_variables,test,evidence,status
+T7.1,c5.5/RFC5681,"byte cwnd; ssthresh=max receive window; initial 2*SMSS fallback",src/tju_tcp.c:initialize_internal cwnd/ssthresh,t1_wire_seq_test and 10MiB no-loss,evidence/t7_noloss_client_fresh.event.trace,PASS
+T7.2,c5.5,"send right edge uses min(cwnd,rwnd)",src/tju_tcp.c:flush_send_locked send_window,trace flight/right_edge,evidence/t7_noloss_client_fresh.event.trace,PASS
+T7.3,RFC5681 slow start,"new cumulative data ACK credits at most SMSS; handshake ACK excluded",src/tju_tcp.c:reno_ack_locked,handshake and no-loss trace,evidence/t7_noloss_client_fresh.event.trace,PASS
+T7.4,RFC5681 congestion avoidance,"SMSS^2/cwnd accumulator prevents integer starvation",src/tju_tcp.c:reno_ack_locked,phase transition trace,evidence/t7_noloss_flow.png,PASS
+T7.5,RFC5681 timeout,"ssthresh=max(FlightSize/2,2SMSS), cwnd=SMSS",src/tju_tcp.c:timer_main,loss trace RTO events,evidence/t7_loss5_client_fresh.event.trace,PASS
+T7.6,RFC5681 fast retransmit,"third eligible dupACK retransmits once; recovery ACK sets cwnd=ssthresh",src/tju_tcp.c:acknowledge_locked,5% loss trace,evidence/t7_loss5_client_fresh.event.trace,PASS
+T7.7,RFC5681 ACK rules,"duplicate/cumulative ACKs do not double credit",src/tju_tcp.c:acknowledge_locked,loss trace ACK_ADVANCE/dupack,evidence/t7_loss5_client_fresh.event.trace,PASS
+T5 regression,course 5.4,"rwnd zero and probes preserve data",src/tju_tcp.c:flush_send_locked/timer_main,8MiB zero-window test,evidence/t7_zero_window_client_fresh.event.trace,PASS
+T8.1,course 10.6,"repeatable matrix and SHA-256",verification/summarize_traces.py,three representative VM runs,evidence/t7_t8_experiments.csv,PASS
+T8.2,course 10.6,"sanitizer and memory review",verification/run_asan_ubsan.sh; valgrind,ASan/UBSan and valgrind,evidence/t7_asan_ubsan.log; evidence/t7_valgrind.log,PASS
+T8.3,course 10.6,"TSan separately attempted",verification/run_tsan.sh,linker capability check,evidence/t7_tsan.log,BLOCKED
+T9,delivery rules,"reports only cite real source/log/trace",final artifacts,manual evidence audit,最终进度报告.md,PENDING_ONLINE

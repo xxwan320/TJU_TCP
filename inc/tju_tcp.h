@@ -56,5 +56,14 @@ int tju_close (tju_tcp_t* sock);
 
 
 int tju_handle_packet(tju_tcp_t* sock, char* pkt);
+int tju_handle_packet_len(tju_tcp_t* sock, char* pkt, int packet_len);
+int tju_validate_packet(const char* pkt, int packet_len);
+int tju_seq_before(uint32_t left, uint32_t right);
+int tju_seq_after(uint32_t left, uint32_t right);
+uint16_t tju_window_from_space(size_t available_space);
+void tju_rto_update_values(int* have_sample, double* srtt, double* rttvar,
+                           double* rto_seconds, double sample_seconds);
+int tju_retain_for_dispatch(tju_tcp_t* sock);
+void tju_release_after_dispatch(tju_tcp_t* sock);
 #endif
 

@@ -7,13 +7,14 @@
 #include "tju_tcp.h"
 
 #define MAX_SOCK 32
-tju_tcp_t* listen_socks[MAX_SOCK];
-tju_tcp_t* established_socks[MAX_SOCK];
+extern tju_tcp_t* listen_socks[MAX_SOCK];
+extern tju_tcp_t* established_socks[MAX_SOCK];
 
 /*
 模拟Linux内核收到一份TCP报文的处理函数
 */
 void onTCPPocket(char* pkt);
+void onTCPPocketWithLen(char* pkt, int packet_len);
 
 
 /*
@@ -35,7 +36,7 @@ void startSimulation();
 void* receive_thread(void * in);
 
 // 接受UDP的socket的标识符
-int BACKEND_UDPSOCKET_ID;
+extern int BACKEND_UDPSOCKET_ID;
 
 
 /*
@@ -48,5 +49,9 @@ int BACKEND_UDPSOCKET_ID;
   不过由于本项目是TCP 协议都一样, 就没必要了)
 */
 int cal_hash(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port);
+int kernel_register_listener(tju_tcp_t* sock);
+int kernel_register_connection(tju_tcp_t* sock);
+void kernel_remove_listener(tju_tcp_t* sock);
+void kernel_remove_connection(tju_tcp_t* sock);
 
 #endif

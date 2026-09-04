@@ -1,0 +1,4 @@
+case_id,data_size_bytes,delay_ms,loss_pct,bandwidth_mbps,elapsed_s,goodput_mbps,retransmissions,RTO_events,fast_retransmits,max_cwnd,min_rwnd,SHA256_match,final_state,result
+t7_noloss,10485760,20,0,100,17.417153,4.816,0,0,0,6900725.0,65535.0,true,CLOSED,PASS
+t7_loss5,1048576,20,5,100,33.666023,0.249,32,14,18,115920.0,65535.0,true,CLOSED,PASS
+t7_zero_window,8388608,20,0,100,18.577733,3.612,0,0,0,6900301.0,0.0,true,CLOSED,PASS
