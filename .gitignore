@@ -1,2 +1,7 @@
 *.md
 *.log
+
+*.md
+*.log
+*.csv
+*.trace

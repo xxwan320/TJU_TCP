@@ -10,6 +10,10 @@
 #define INITIAL_RTO_NS NSEC_PER_SEC
 #define MIN_RTO_NS NSEC_PER_SEC
 #define MAX_RTO_NS (60ULL * NSEC_PER_SEC)
+#define LOSS_PROBE_NS (20ULL * 1000ULL * 1000ULL)
+#define MAX_LOSS_PROBES 3U
+#define FAST_LOSS_BETA_NUM 7U
+#define FAST_LOSS_BETA_DEN 10U
 #define HANDSHAKE_RESET_RTO_NS (3ULL * NSEC_PER_SEC)
 #define TJU_MAX_RETRIES 5U
 #define TJU_MSL_SECONDS 5U
@@ -83,6 +87,8 @@ typedef struct tju_internal {
     uint64_t ca_accumulator;
     reno_phase reno;
     bool fast_recovery_pending;
+    bool timeout_recovery_pending;
+    uint32_t recovery_point;
 
     tx_segment* tx_head;
     tx_segment* tx_tail;
@@ -104,6 +110,7 @@ typedef struct tju_internal {
     double rttvar;
     uint64_t rto_ns;
     bool handshake_retransmitted;
+    unsigned loss_probe_count;
     uint64_t persist_deadline_ns;
     uint64_t persist_interval_ns;
 
@@ -333,7 +340,10 @@ static void send_tx_node_locked(tju_internal* in, tx_segment* node, bool retrans
 }
 
 static void flush_send_locked(tju_internal* in){
-    uint64_t send_window = in->peer_wnd < in->cwnd ? in->peer_wnd : in->cwnd;
+    uint64_t congestion_window = in->cwnd;
+    if(!in->fast_recovery_pending && in->dup_ack_count > 0 && in->dup_ack_count < 3)
+        congestion_window += (uint64_t)in->dup_ack_count * MAX_DLEN;
+    uint64_t send_window = in->peer_wnd < congestion_window ? in->peer_wnd : congestion_window;
     uint32_t right_edge = in->snd_una + (uint32_t)send_window;
     for(tx_segment* node = in->tx_head; node != NULL; node = node->next){
         if(node->sent) continue;
@@ -350,13 +360,6 @@ static void flush_send_locked(tju_internal* in){
 
 static void reno_ack_locked(tju_internal* in, size_t acknowledged){
     if(acknowledged == 0) return;
-    if(in->fast_recovery_pending){
-        in->cwnd = in->ssthresh;
-        in->reno = RENO_CONGESTION_AVOIDANCE;
-        in->fast_recovery_pending = false;
-        in->ca_accumulator = 0;
-        return;
-    }
     uint64_t credit = acknowledged > MAX_DLEN ? MAX_DLEN : acknowledged;
     if(in->cwnd < in->ssthresh){
         uint64_t next = in->cwnd + credit;
@@ -410,19 +413,28 @@ static void free_tx_node(tx_segment* node){
 static bool acknowledge_locked(tju_internal* in, uint32_t ack, bool eligible_dup){
     if(!seq_between(ack, in->snd_una, in->snd_nxt)) return false;
     if(ack == in->snd_una){
-        if(eligible_dup && in->tx_head != NULL && in->tx_head->sent){
+        if(eligible_dup && !in->timeout_recovery_pending &&
+           in->tx_head != NULL && in->tx_head->sent){
             if(in->dup_ack == ack) in->dup_ack_count++;
             else { in->dup_ack = ack; in->dup_ack_count = 1; }
             if(in->dup_ack_count == 3){
                 uint64_t flight = in->snd_nxt - in->snd_una;
-                in->ssthresh = flight / 2U;
+                /* Use CUBIC's 0.7 multiplicative decrease for losses found by
+                 * duplicate ACKs.  An RTO still performs Reno's 0.5 decrease. */
+                in->ssthresh = flight * FAST_LOSS_BETA_NUM / FAST_LOSS_BETA_DEN;
                 if(in->ssthresh < 2U * MAX_DLEN) in->ssthresh = 2U * MAX_DLEN;
-                in->cwnd = MAX_DLEN;
+                in->cwnd = in->ssthresh + 3U * MAX_DLEN;
                 in->reno = RENO_FAST_RECOVERY;
                 in->fast_recovery_pending = true;
+                in->recovery_point = in->snd_nxt;
                 in->ca_accumulator = 0;
                 send_tx_node_locked(in, in->tx_head, true);
                 trace_event(in, "FAST_RETRANSMIT", in->tx_head->seq, ack, true);
+            }else if(in->dup_ack_count > 3 && in->fast_recovery_pending){
+                in->cwnd += MAX_DLEN;
+                flush_send_locked(in);
+            }else if(in->dup_ack_count < 3){
+                flush_send_locked(in);
             }
         }
         return false;
@@ -449,10 +461,35 @@ static bool acknowledge_locked(tju_internal* in, uint32_t ack, bool eligible_dup
     }
     if(!ambiguous_rtt && sample_sent_ns != 0)
         update_rtt_locked(in, (now - sample_sent_ns) / 1e9);
-    reno_ack_locked(in, acknowledged_payload);
     in->snd_una = ack;
+    in->loss_probe_count = 0;
     in->dup_ack = ack;
     in->dup_ack_count = 0;
+    if(in->timeout_recovery_pending){
+        if(seq_lt(ack, in->recovery_point) && in->tx_head != NULL && in->tx_head->sent){
+            send_tx_node_locked(in, in->tx_head, true);
+            trace_event(in, "ACK_DRIVEN_RETRANSMIT", in->tx_head->seq, ack, true);
+        }else{
+            in->timeout_recovery_pending = false;
+            in->recovery_point = 0;
+            reno_ack_locked(in, acknowledged_payload);
+        }
+    }else if(in->fast_recovery_pending){
+        if(seq_lt(ack, in->recovery_point) && in->tx_head != NULL){
+            in->cwnd = in->ssthresh + 3U * MAX_DLEN;
+            in->reno = RENO_FAST_RECOVERY;
+            send_tx_node_locked(in, in->tx_head, true);
+            trace_event(in, "FAST_RETRANSMIT", in->tx_head->seq, ack, true);
+        }else{
+            in->cwnd = in->ssthresh;
+            in->reno = RENO_CONGESTION_AVOIDANCE;
+            in->fast_recovery_pending = false;
+            in->recovery_point = 0;
+            in->ca_accumulator = 0;
+        }
+    }else{
+        reno_ack_locked(in, acknowledged_payload);
+    }
     in->persist_deadline_ns = 0;
     pthread_cond_broadcast(&in->send_cv);
     pthread_cond_signal(&in->timer_cv);
@@ -582,6 +619,11 @@ static uint64_t next_deadline_locked(tju_internal* in){
     if(in->tx_head != NULL && in->tx_head->sent){
         uint64_t retransmit = in->tx_head->last_sent_ns + in->rto_ns;
         if(deadline == 0 || retransmit < deadline) deadline = retransmit;
+        if(in->owner->state == ESTABLISHED && in->tx_head->len != 0 &&
+           in->loss_probe_count < MAX_LOSS_PROBES){
+            uint64_t probe = in->tx_head->last_sent_ns + LOSS_PROBE_NS;
+            if(probe < deadline) deadline = probe;
+        }
     }
     if(in->persist_deadline_ns != 0 && (deadline == 0 || in->persist_deadline_ns < deadline))
         deadline = in->persist_deadline_ns;
@@ -620,6 +662,14 @@ static void* timer_main(void* argument){
             continue;
         }
         tx_segment* node = in->tx_head;
+        if(node != NULL && node->sent && node->len != 0 &&
+           in->loss_probe_count < MAX_LOSS_PROBES &&
+           node->last_sent_ns + LOSS_PROBE_NS <= now){
+            in->loss_probe_count++;
+            send_tx_node_locked(in, node, true);
+            trace_event(in, "LOSS_PROBE", node->seq, in->rcv_nxt, true);
+            continue;
+        }
         if(node != NULL && node->sent && node->last_sent_ns + in->rto_ns <= now){
             if(node->retries >= TJU_MAX_RETRIES){
                 fail_connection_locked(in, "RETRY_LIMIT");
@@ -632,7 +682,11 @@ static void* timer_main(void* argument){
                 in->cwnd = MAX_DLEN;
                 in->reno = RENO_SLOW_START;
                 in->fast_recovery_pending = false;
+                in->timeout_recovery_pending = true;
+                in->recovery_point = in->snd_nxt;
                 in->ca_accumulator = 0;
+                in->dup_ack = in->snd_una;
+                in->dup_ack_count = 0;
             }
             send_tx_node_locked(in, node, true);
             if(in->rto_ns < MAX_RTO_NS / 2) in->rto_ns *= 2;
