@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 尝试用 ThreadSanitizer 检查共享状态；工具链缺 libtsan 时应记为环境阻塞。
 set -o pipefail
 cd /vagrant/tju_tcp || exit 1
 

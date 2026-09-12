@@ -3,6 +3,7 @@
 #include <signal.h>
 #include <stdio.h>
 
+/* 可靠传输压力服务端：循环短读直至收满 50 MB，并落盘供逐字节比较。 */
 #define MIN_LEN 1000
 #define EACHSIZE 10*MIN_LEN
 #define MAXSIZE 50*MIN_LEN*MIN_LEN
@@ -11,6 +12,7 @@ int t_times = 5000;
 char allbuf[MAXSIZE] = {'\0'}; //设置全局变量
 
 void fflushbeforeexit(int signo){
+    // 收到终止信号仍保存当前缓冲，便于诊断传输停止在何处。
     printf("意外退出server\n");
 
     FILE *wfile;
@@ -56,6 +58,7 @@ int main(int argc, char **argv) {
 
     int alllen = 0;
     int print_s = 0;
+    // TCP 是字节流，不能假定一次 recv 对应客户端的一次 send。
     while(alllen < t_times*EACHSIZE){
         char *buf = malloc(EACHSIZE);
         memset(buf, 0, EACHSIZE);

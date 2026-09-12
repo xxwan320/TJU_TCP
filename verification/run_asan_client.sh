@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 在 sanitizer 客户端上传 1 MiB；关闭 leak 检测以避开进程级 detached 接收线程。
 set -o pipefail
 echo 'COMMAND: dd if=/dev/zero of=/tmp/tju_asan_input.bin bs=1M count=1 status=none'
 dd if=/dev/zero of=/tmp/tju_asan_input.bin bs=1M count=1 status=none || exit $?

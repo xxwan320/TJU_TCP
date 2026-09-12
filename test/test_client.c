@@ -1,6 +1,7 @@
 #include "tju_tcp.h"
 #include <string.h>
 
+/* 连接建立测试客户端：成功返回只表示 tju_connect 完成三次握手。 */
 
 int main(int argc, char **argv) {
     // 开启仿真环境 

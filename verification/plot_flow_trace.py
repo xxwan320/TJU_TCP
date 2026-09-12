@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 
 
 def parse(path):
+    """读取 trace 中每行的 key=value 字段，忽略普通文本。"""
     rows = []
     with open(path, encoding="utf-8", errors="replace") as stream:
         for line in stream:
@@ -20,6 +21,7 @@ def parse(path):
 
 
 def numbers(rows, key, default=0.0):
+    """把指定指标转为浮点序列，并把 NA/缺失值替换为默认值。"""
     values = []
     for row in rows:
         value = row.get(key, str(default))
@@ -28,6 +30,7 @@ def numbers(rows, key, default=0.0):
 
 
 def main() -> int:
+    """生成 rwnd/flight、拥塞窗口、接收占用和 RTT/RTO 四联图。"""
     if len(sys.argv) != 3:
         print(f"usage: {sys.argv[0]} input.trace output.png", file=sys.stderr)
         return 2
@@ -35,6 +38,7 @@ def main() -> int:
     if not rows:
         print("trace contains no events", file=sys.stderr)
         return 1
+    # 仅等间隔降采样绘图点，原始 trace 与统计值不被改写。
     stride = max(1, len(rows) // 20000)
     rows = rows[::stride]
     start = int(rows[0]["timestamp_ns"])

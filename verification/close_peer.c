@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+/* 参数化关闭对端：组合 server/client 与主动/同时关闭，覆盖四类状态路径。 */
 int main(int argc, char** argv){
     if(argc != 3) return 2;
     int server_role = strcmp(argv[1], "server") == 0;
@@ -21,6 +22,7 @@ int main(int argc, char** argv){
     }
     if(connection == NULL) return 5;
 
+    // 非同时场景下客户端等待服务端 FIN，以便验证被动关闭返回 EOF。
     if(!simultaneous && !server_role){
         char byte;
         int result = tju_recv(connection, &byte, 1);

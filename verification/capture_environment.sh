@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 固化主机、编译器、实验网卡、qdisc 和残留进程，便于解释不可复现差异。
 echo "HOSTNAME=$(hostname)"
 . /etc/os-release
 echo "OS=$PRETTY_NAME"

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
+# 一站式构建门禁：根项目、独立单元验证及课程测试程序都必须可从 clean 构建。
 set -o pipefail
 
 cd /vagrant/tju_tcp || exit 1
+# 每一步立即检查返回码，避免后续成功命令掩盖前面的失败。
 echo 'COMMAND: make clean'
 make clean
 clean_rc=$?

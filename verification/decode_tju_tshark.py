@@ -7,12 +7,14 @@ import sys
 
 
 def main() -> int:
+    """把 tshark 导出的 UDP payload 十六进制列解码为可审计 CSV。"""
     if len(sys.argv) != 3:
         print(f"usage: {sys.argv[0]} tshark.tsv decoded.csv", file=sys.stderr)
         return 2
     rows = []
     with open(sys.argv[1], "rb") as raw:
         prefix = raw.read(2)
+    # Windows tshark 导出可能是 UTF-16，Linux/手工导出通常是 UTF-8。
     encoding = "utf-16" if prefix in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
     with open(sys.argv[1], encoding=encoding) as source:
         for line in source:
@@ -22,6 +24,7 @@ def main() -> int:
             payload = bytes.fromhex(columns[6])
             if len(payload) < 20:
                 continue
+            # ! 表示网络字节序；格式宽度总和严格等于固定 20-byte 头。
             src, dst, seq, ack, hlen, plen, flags, window, ext = struct.unpack(
                 "!HHIIHHBHB", payload[:20]
             )

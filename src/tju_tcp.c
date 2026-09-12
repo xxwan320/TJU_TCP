@@ -6,6 +6,16 @@
 #include <stdbool.h>
 #include <time.h>
 
+/*
+ * TJU_TCP 协议主体。
+ *
+ * 每条连接由一个 tju_internal（连接控制块，CCB）驱动。应用线程、UDP 收包线程
+ * 和该连接的 timer 线程共享它，所有可变协议状态均由 in->lock 保护。发送侧的
+ * 核心不变量是 SND.UNA（最早未确认）→SND.NXT（下一首次发送）→SND.WRITE
+ *（下一入队序号）；接收侧仅把从 RCV.NXT 开始连续的数据交付给应用。
+ */
+
+// 计时参数集中定义。20 ms loss probe 和 0.7 快速丢包退让属于本实现扩展。
 #define NSEC_PER_SEC 1000000000ULL
 #define INITIAL_RTO_NS NSEC_PER_SEC
 #define MIN_RTO_NS NSEC_PER_SEC
@@ -22,6 +32,7 @@
 #endif
 
 typedef struct tx_segment {
+    // [seq,end) 是该节点占用的序号区间；SYN/FIN 即使无 payload 也占 1。
     uint32_t seq;
     uint32_t end;
     uint8_t flags;
@@ -36,6 +47,7 @@ typedef struct tx_segment {
 } tx_segment;
 
 typedef struct rx_segment {
+    // 尚不能从 RCV.NXT 连续交付的失序区间，按相对序号排序并合并重叠。
     uint32_t seq;
     uint16_t len;
     char* data;
@@ -43,6 +55,7 @@ typedef struct rx_segment {
 } rx_segment;
 
 typedef struct accept_node {
+    // 三次握手完成后的 child socket 通过监听 socket 的 FIFO 队列交给 accept。
     tju_tcp_t* sock;
     struct accept_node* next;
 } accept_node;
@@ -54,6 +67,7 @@ typedef enum {
 } reno_phase;
 
 typedef struct tju_internal {
+    // 同一把锁保护状态机、序号、队列、窗口、计时字段和 dispatch 引用。
     pthread_mutex_t lock;
     pthread_cond_t state_cv;
     pthread_cond_t recv_cv;
@@ -74,6 +88,7 @@ typedef struct tju_internal {
     accept_node* accept_tail;
     bool accept_enqueued;
 
+    // RFC 风格发送/接收序号变量；32-bit 加减自然回绕。
     uint32_t iss;
     uint32_t irs;
     uint32_t snd_una;
@@ -82,6 +97,7 @@ typedef struct tju_internal {
     uint32_t rcv_nxt;
     uint32_t peer_wnd;
     uint32_t last_adv_window;
+    // peer_wnd 是流量控制，cwnd/ssthresh 是拥塞控制，单位均为 byte。
     uint64_t cwnd;
     uint64_t ssthresh;
     uint64_t ca_accumulator;
@@ -90,17 +106,20 @@ typedef struct tju_internal {
     bool timeout_recovery_pending;
     uint32_t recovery_point;
 
+    // tx 队列含已发送未确认及尚未发送节点；rx 队列只含失序唯一字节。
     tx_segment* tx_head;
     tx_segment* tx_tail;
     size_t tx_buffered;
     rx_segment* rx_head;
     size_t rx_ooo_bytes;
 
+    // 连续数据进入固定容量环形缓冲区，避免每次 recv 都 realloc/memmove。
     char* recv_ring;
     size_t recv_head;
     size_t recv_tail;
     size_t recv_used;
 
+    // RTT/RTO 遵循平滑估计；重传歧义由 retransmitted 标记实现 Karn 规则。
     uint32_t dup_ack;
     unsigned dup_ack_count;
     bool have_rtt;
@@ -114,6 +133,7 @@ typedef struct tju_internal {
     uint64_t persist_deadline_ns;
     uint64_t persist_interval_ns;
 
+    // 半关闭及 FIN/TIME-WAIT 状态；fin_pending 防止 FIN 越过数据空洞。
     bool send_closed;
     bool recv_fin;
     bool fin_pending;
@@ -133,6 +153,7 @@ static FILE* trace_file;
 static void destroy_internal(tju_tcp_t* sock, tju_internal* in);
 static int finish_connection_locked(tju_tcp_t* sock, tju_internal* in, int result);
 
+// 分发引用把“从全局表查到 socket”与“完成报文处理”组成安全生命周期区间。
 int tju_retain_for_dispatch(tju_tcp_t* sock){
     if(sock == NULL || sock->internal == NULL) return 0;
     tju_internal* in = sock->internal;
@@ -151,18 +172,21 @@ void tju_release_after_dispatch(tju_tcp_t* sock){
 }
 
 static uint64_t monotonic_ns(void){
+    // 单调时钟不受系统时间校准影响，适合 RTT、RTO 和 TIME-WAIT deadline。
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t)now.tv_sec * NSEC_PER_SEC + (uint64_t)now.tv_nsec;
 }
 
 static struct timespec ns_to_timespec(uint64_t value){
+    // pthread_cond_timedwait 接收绝对 timespec；条件变量也配置为 MONOTONIC。
     struct timespec result;
     result.tv_sec = (time_t)(value / NSEC_PER_SEC);
     result.tv_nsec = (long)(value % NSEC_PER_SEC);
     return result;
 }
 
+// 模 2^32 序号比较：窗口小于半个序号空间时，有符号差能正确跨越 0 回绕。
 static bool seq_lt(uint32_t a, uint32_t b){ return (int32_t)(a - b) < 0; }
 static bool seq_le(uint32_t a, uint32_t b){ return (int32_t)(a - b) <= 0; }
 static bool seq_gt(uint32_t a, uint32_t b){ return (int32_t)(a - b) > 0; }
@@ -174,10 +198,12 @@ int tju_seq_before(uint32_t left, uint32_t right){ return seq_lt(left, right); }
 int tju_seq_after(uint32_t left, uint32_t right){ return seq_gt(left, right); }
 
 uint16_t tju_window_from_space(size_t available_space){
+    // 不能直接强转：65536 若截断为 uint16_t 会错误地通告“零窗口”。
     return available_space > UINT16_MAX ? UINT16_MAX : (uint16_t)available_space;
 }
 
 int tju_validate_packet(const char* pkt, int packet_len){
+    // 这里只验证框架线格式边界；未给 checksum，因而不验证内容完整性。
     if(pkt == NULL || packet_len < DEFAULT_HEADER_LEN || packet_len > MAX_LEN) return 0;
     uint16_t hlen = get_hlen((char*)pkt);
     uint16_t plen = get_plen((char*)pkt);
@@ -185,6 +211,7 @@ int tju_validate_packet(const char* pkt, int packet_len){
 }
 
 static uint64_t mix64(uint64_t x){
+
     x += 0x9e3779b97f4a7c15ULL;
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
     x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
@@ -192,6 +219,7 @@ static uint64_t mix64(uint64_t x){
 }
 
 static void initialize_isn_secret(void){
+    
     int fd = open("/dev/urandom", O_RDONLY);
     if(fd >= 0){
         ssize_t got = read(fd, &isn_secret, sizeof(isn_secret));
@@ -202,6 +230,7 @@ static void initialize_isn_secret(void){
 }
 
 static uint32_t generate_isn(tju_sock_addr local, tju_sock_addr remote){
+    // 四元组、单调时间与计数器共同避免短时间重复使用相同初始序号。
     pthread_once(&isn_once, initialize_isn_secret);
     pthread_mutex_lock(&isn_lock);
     uint64_t count = ++isn_counter;
@@ -213,6 +242,7 @@ static uint32_t generate_isn(tju_sock_addr local, tju_sock_addr remote){
 }
 
 static const char* state_name(int state){
+    // 仅供结构化 trace 输出，不参与协议分支判断。
     switch(state){
         case CLOSED: return "CLOSED"; case LISTEN: return "LISTEN";
         case SYN_SENT: return "SYN_SENT"; case SYN_RECV: return "SYN_RECV";
@@ -234,6 +264,7 @@ static const char* reno_name(reno_phase phase){
 
 static void trace_event(tju_internal* in, const char* event, uint32_t seq,
                         uint32_t ack, bool retransmitted){
+    // 每行 key=value，便于脚本统计；trace_lock 防止多连接日志相互穿插。
     pthread_mutex_lock(&trace_lock);
     if(trace_file == NULL){
         char hostname[64] = {0};
@@ -266,6 +297,7 @@ static void trace_event(tju_internal* in, const char* event, uint32_t seq,
 }
 
 static void set_state_locked(tju_internal* in, int state, const char* event){
+    // 调用者持有 in->lock；状态变化同时唤醒 connect/close 等待者。
     if(in->owner->state != state){
         in->owner->state = state;
         trace_event(in, event, in->snd_nxt, in->rcv_nxt, false);
@@ -274,6 +306,7 @@ static void set_state_locked(tju_internal* in, int state, const char* event){
 }
 
 static uint16_t advertised_window_locked(tju_internal* in){
+    // 有序 ring 和失序队列都占接收容量；不足一个 SMSS 时通告 0 抑制小窗口。
     size_t used = in->recv_used + in->rx_ooo_bytes;
     size_t space = used < TCP_RECVWN_SIZE ? TCP_RECVWN_SIZE - used : 0;
     if(space < MAX_DLEN && used != 0) space = 0;
@@ -283,6 +316,7 @@ static uint16_t advertised_window_locked(tju_internal* in){
 static void send_packet_locked(tju_internal* in, uint32_t seq, uint32_t ack,
                                uint8_t flags, const char* data, uint16_t len,
                                const char* event, bool retransmitted){
+    // 每个反向报文都捎带最新接收窗口；纯 ACK 也走同一个序列化/trace 路径。
     uint16_t window = advertised_window_locked(in);
     char* packet = create_packet_buf(in->owner->established_local_addr.port,
                                      in->owner->established_remote_addr.port,
@@ -298,6 +332,7 @@ static void send_packet_locked(tju_internal* in, uint32_t seq, uint32_t ack,
 }
 
 static tx_segment* make_tx(uint32_t seq, uint8_t flags, const char* data, uint16_t len){
+    // 深拷贝应用数据；节点一直保留到累计 ACK 覆盖 end 或连接销毁。
     tx_segment* node = calloc(1, sizeof(*node));
     if(node == NULL) return NULL;
     node->seq = seq;
@@ -313,6 +348,7 @@ static tx_segment* make_tx(uint32_t seq, uint8_t flags, const char* data, uint16
 }
 
 static void append_tx_locked(tju_internal* in, tx_segment* node){
+    // snd_write 由调用者分配序号，本函数只维护 FIFO 和缓存占用计数。
     if(in->tx_tail != NULL) in->tx_tail->next = node;
     else in->tx_head = node;
     in->tx_tail = node;
@@ -320,6 +356,7 @@ static void append_tx_locked(tju_internal* in, tx_segment* node){
 }
 
 static void send_tx_node_locked(tju_internal* in, tx_segment* node, bool retransmit){
+    // 首次发送推进 SND.NXT；重传复用原 seq，不得重复消耗序号空间。
     uint8_t flags = node->flags;
     uint32_t ack = 0;
     if(flags & ACK_FLAG_MASK){ ack = in->rcv_nxt; }
@@ -340,7 +377,9 @@ static void send_tx_node_locked(tju_internal* in, tx_segment* node, bool retrans
 }
 
 static void flush_send_locked(tju_internal* in){
+    // 新数据右边界为 SND.UNA + min(rwnd,cwnd)；已发送数据不会因窗口缩小撤回。
     uint64_t congestion_window = in->cwnd;
+    // 前两个重复 ACK 临时多放行一个 SMSS，属于 Limited Transmit 风格优化。
     if(!in->fast_recovery_pending && in->dup_ack_count > 0 && in->dup_ack_count < 3)
         congestion_window += (uint64_t)in->dup_ack_count * MAX_DLEN;
     uint64_t send_window = in->peer_wnd < congestion_window ? in->peer_wnd : congestion_window;
@@ -351,6 +390,7 @@ static void flush_send_locked(tju_internal* in){
         if(!control && (in->peer_wnd == 0 || seq_gt(node->end, right_edge))) break;
         send_tx_node_locked(in, node, false);
     }
+    // 零窗口不能依赖普通重传解决：启动 persist，主动询问窗口是否已重开。
     if(in->peer_wnd == 0 && in->tx_head != NULL && in->persist_deadline_ns == 0){
         in->persist_interval_ns = in->rto_ns;
         in->persist_deadline_ns = monotonic_ns() + in->persist_interval_ns;
@@ -359,6 +399,7 @@ static void flush_send_locked(tju_internal* in){
 }
 
 static void reno_ack_locked(tju_internal* in, size_t acknowledged){
+    // 新 ACK 在慢启动每次最多增 1 SMSS；拥塞避免累计约 SMSS^2/cwnd。
     if(acknowledged == 0) return;
     uint64_t credit = acknowledged > MAX_DLEN ? MAX_DLEN : acknowledged;
     if(in->cwnd < in->ssthresh){
@@ -378,6 +419,7 @@ static void reno_ack_locked(tju_internal* in, size_t acknowledged){
 
 void tju_rto_update_values(int* have_sample, double* srtt, double* rttvar,
                            double* rto_seconds, double sample){
+    // RFC 6298：首样本初始化；后续必须先更新 RTTVAR，再更新 SRTT。
     if(!*have_sample){
         *srtt = sample;
         *rttvar = sample / 2.0;
@@ -396,6 +438,7 @@ void tju_rto_update_values(int* have_sample, double* srtt, double* rttvar,
 }
 
 static void update_rtt_locked(tju_internal* in, double sample){
+    // 在连接控制块的纳秒表示与便于测试的秒表示之间转换。
     int have_sample = in->have_rtt ? 1 : 0;
     double rto = in->rto_ns / 1e9;
     tju_rto_update_values(&have_sample, &in->srtt, &in->rttvar, &rto, sample);
@@ -411,8 +454,10 @@ static void free_tx_node(tx_segment* node){
 }
 
 static bool acknowledge_locked(tju_internal* in, uint32_t ack, bool eligible_dup){
+    // 只接受当前已发送区间内的累计 ACK，防止 ACK 越过 SND.NXT 释放未发送数据。
     if(!seq_between(ack, in->snd_una, in->snd_nxt)) return false;
     if(ack == in->snd_una){
+        // 只有无数据、无 SYN/FIN 的纯 ACK 才能计入重复 ACK 阈值。
         if(eligible_dup && !in->timeout_recovery_pending &&
            in->tx_head != NULL && in->tx_head->sent){
             if(in->dup_ack == ack) in->dup_ack_count++;
@@ -440,6 +485,7 @@ static bool acknowledge_locked(tju_internal* in, uint32_t ack, bool eligible_dup
         return false;
     }
 
+    // 新累计 ACK：先判断 Karn 歧义，再释放完全覆盖的队首节点。
     uint64_t now = monotonic_ns();
     in->last_sample_valid = false;
     bool ambiguous_rtt = false;
@@ -459,12 +505,14 @@ static bool acknowledge_locked(tju_internal* in, uint32_t ack, bool eligible_dup
         acknowledged_payload += done->len;
         free_tx_node(done);
     }
+    // 一个累计 ACK 覆盖的任一节点重传过，整个样本都无法对应唯一一次发送。
     if(!ambiguous_rtt && sample_sent_ns != 0)
         update_rtt_locked(in, (now - sample_sent_ns) / 1e9);
     in->snd_una = ack;
     in->loss_probe_count = 0;
     in->dup_ack = ack;
     in->dup_ack_count = 0;
+    // partial ACK 在恢复点之前时继续重传下一个洞；越过恢复点才退出恢复。
     if(in->timeout_recovery_pending){
         if(seq_lt(ack, in->recovery_point) && in->tx_head != NULL && in->tx_head->sent){
             send_tx_node_locked(in, in->tx_head, true);
@@ -500,11 +548,13 @@ static bool acknowledge_locked(tju_internal* in, uint32_t ack, bool eligible_dup
 }
 
 static void send_ack_locked(tju_internal* in, const char* event){
+    // 累计 ACK 始终声明下一期望序号 RCV.NXT，不确认失序空洞后的字节。
     send_packet_locked(in, in->snd_nxt, in->rcv_nxt, ACK_FLAG_MASK, NULL, 0,
                        event, false);
 }
 
 static size_t ring_write_locked(tju_internal* in, const char* data, size_t len){
+    // 至多两次 memcpy 处理环尾回绕；调用者保证 in->lock 已持有。
     size_t free_space = TCP_RECVWN_SIZE - in->recv_used;
     if(len > free_space) len = free_space;
     size_t first = len;
@@ -518,12 +568,14 @@ static size_t ring_write_locked(tju_internal* in, const char* data, size_t len){
 }
 
 static void recalc_ooo_locked(tju_internal* in){
+    // 合并/删除节点后重算失序唯一字节，供接收窗口扣减。
     size_t total = 0;
     for(rx_segment* node = in->rx_head; node != NULL; node = node->next) total += node->len;
     in->rx_ooo_bytes = total;
 }
 
 static void insert_rx_locked(tju_internal* in, uint32_t seq, const char* data, uint16_t len){
+    // 先裁掉已交付前缀，再限制到当前接收容量，最后合并相交或相邻区间。
     int32_t delta = (int32_t)(seq - in->rcv_nxt);
     if(delta < 0){
         uint32_t trim = (uint32_t)(-delta);
@@ -575,6 +627,7 @@ static void insert_rx_locked(tju_internal* in, uint32_t seq, const char* data, u
     *link = node;
     recalc_ooo_locked(in);
 
+    // 只有缺口补齐后才能推进 RCV.NXT；这保证有序且每字节最多交付一次。
     while(in->rx_head != NULL && in->rx_head->seq == in->rcv_nxt){
         rx_segment* ready = in->rx_head;
         in->rx_head = ready->next;
@@ -588,12 +641,14 @@ static void insert_rx_locked(tju_internal* in, uint32_t seq, const char* data, u
 }
 
 static void enter_time_wait_locked(tju_internal* in, const char* event){
+    // 主动关闭方保留 2*MSL，既吸收旧报文也能重答对端重传的 FIN。
     set_state_locked(in, TIME_WAIT, event);
     in->time_wait_deadline_ns = monotonic_ns() + 2ULL * TJU_MSL_SECONDS * NSEC_PER_SEC;
     pthread_cond_signal(&in->timer_cv);
 }
 
 static void consume_fin_if_ready_locked(tju_internal* in){
+    // FIN 只有恰好位于 RCV.NXT 才可消费；否则等待前面的数据空洞补齐。
     if(!in->fin_pending || in->fin_seq != in->rcv_nxt) return;
     in->fin_pending = false;
     in->recv_fin = true;
@@ -607,6 +662,7 @@ static void consume_fin_if_ready_locked(tju_internal* in){
 }
 
 static void fail_connection_locked(tju_internal* in, const char* event){
+    // 统一错误出口唤醒可能阻塞在 recv、send、connect 或 close 的线程。
     in->error = -1;
     set_state_locked(in, CLOSED, event);
     pthread_cond_broadcast(&in->recv_cv);
@@ -614,6 +670,7 @@ static void fail_connection_locked(tju_internal* in, const char* event){
 }
 
 static uint64_t next_deadline_locked(tju_internal* in){
+    // 多种计时任务共用每连接单一 worker，返回最早的绝对 deadline。
     uint64_t deadline = 0;
     if(in->owner->state == TIME_WAIT) deadline = in->time_wait_deadline_ns;
     if(in->tx_head != NULL && in->tx_head->sent){
@@ -631,6 +688,7 @@ static uint64_t next_deadline_locked(tju_internal* in){
 }
 
 static void* timer_main(void* argument){
+    // 条件变量既用于等待 deadline，也用于新 ACK/新发送改变 deadline 后重算。
     tju_internal* in = argument;
     pthread_mutex_lock(&in->lock);
     while(!in->stop){
@@ -654,6 +712,7 @@ static void* timer_main(void* argument){
             continue;
         }
         if(in->persist_deadline_ns != 0 && in->persist_deadline_ns <= now){
+            // 本实现用窗口左边界前的纯 ACK 作探测，对端以窗口更新 ACK 回应。
             send_packet_locked(in, in->snd_una - 1U, in->rcv_nxt, ACK_FLAG_MASK,
                                NULL, 0, "ZERO_WINDOW_PROBE", false);
             if(in->persist_interval_ns < MAX_RTO_NS / 2) in->persist_interval_ns *= 2;
@@ -662,6 +721,7 @@ static void* timer_main(void* argument){
             continue;
         }
         tx_segment* node = in->tx_head;
+        
         if(node != NULL && node->sent && node->len != 0 &&
            in->loss_probe_count < MAX_LOSS_PROBES &&
            node->last_sent_ns + LOSS_PROBE_NS <= now){
@@ -671,6 +731,7 @@ static void* timer_main(void* argument){
             continue;
         }
         if(node != NULL && node->sent && node->last_sent_ns + in->rto_ns <= now){
+            // RTO 对数据执行乘性减小并指数退避；控制段复用同一可靠队列。
             if(node->retries >= TJU_MAX_RETRIES){
                 fail_connection_locked(in, "RETRY_LIMIT");
                 continue;
@@ -699,6 +760,7 @@ static void* timer_main(void* argument){
 }
 
 static int initialize_internal(tju_tcp_t* sock){
+   
     tju_internal* in = calloc(1, sizeof(*in));
     if(in == NULL) return -1;
     in->owner = sock;
@@ -729,6 +791,7 @@ static int initialize_internal(tju_tcp_t* sock){
 }
 
 static int finish_connection_locked(tju_tcp_t* sock, tju_internal* in, int result){
+    // 顺序很关键：禁止新分发→停/join timer→摘表→等在途分发→销毁状态。
     in->stop = true;
     in->destroying = true;
     pthread_cond_broadcast(&in->timer_cv);
@@ -743,6 +806,7 @@ static int finish_connection_locked(tju_tcp_t* sock, tju_internal* in, int resul
 }
 
 tju_tcp_t* tju_socket(){
+    // 公共 window/lock 字段为模板兼容外壳，实际协议同步由 internal 管理。
     tju_tcp_t* sock = calloc(1, sizeof(*sock));
     if(sock == NULL) return NULL;
     sock->state = CLOSED;
@@ -764,6 +828,7 @@ tju_tcp_t* tju_socket(){
 }
 
 int tju_bind(tju_tcp_t* sock, tju_sock_addr bind_addr){
+    // bind 只记录本地地址；真正进入监听表发生在 tju_listen。
     if(sock == NULL || sock->internal == NULL || bind_addr.port == 0) return -1;
     tju_internal* in = sock->internal;
     pthread_mutex_lock(&in->lock);
@@ -774,6 +839,7 @@ int tju_bind(tju_tcp_t* sock, tju_sock_addr bind_addr){
 }
 
 int tju_listen(tju_tcp_t* sock){
+    // 先成功占用监听哈希槽，再发布 LISTEN 状态，避免半注册对象可见。
     if(sock == NULL || sock->internal == NULL || sock->bind_addr.port == 0) return -1;
     tju_internal* in = sock->internal;
     pthread_mutex_lock(&in->lock);
@@ -786,6 +852,7 @@ int tju_listen(tju_tcp_t* sock){
 }
 
 tju_tcp_t* tju_accept(tju_tcp_t* sock){
+    // accept 以谓词循环阻塞，抵抗条件变量虚假唤醒；只返回完成握手的 child。
     if(sock == NULL || sock->internal == NULL) return NULL;
     tju_internal* in = sock->internal;
     pthread_mutex_lock(&in->lock);
@@ -802,6 +869,7 @@ tju_tcp_t* tju_accept(tju_tcp_t* sock){
 }
 
 int tju_connect(tju_tcp_t* sock, tju_sock_addr target_addr){
+    // 主动打开：分配临时端口和 ISS，注册四元组，发送 SYN 后等待状态机推进。
     if(sock == NULL || sock->internal == NULL || target_addr.port == 0) return -1;
     tju_internal* in = sock->internal;
     pthread_mutex_lock(&in->lock);
@@ -832,6 +900,7 @@ int tju_connect(tju_tcp_t* sock, tju_sock_addr target_addr){
 }
 
 int tju_send(tju_tcp_t* sock, const void* buffer, int len){
+    // 字节流不保留应用 write 边界；这里按 MAX_DLEN 切段并复制到可靠发送队列。
     if(sock == NULL || sock->internal == NULL || buffer == NULL || len < 0) return -1;
     if(len == 0) return 0;
     tju_internal* in = sock->internal;
@@ -840,6 +909,7 @@ int tju_send(tju_tcp_t* sock, const void* buffer, int len){
     pthread_mutex_lock(&in->lock);
     if(sock->state != ESTABLISHED || in->send_closed){ pthread_mutex_unlock(&in->lock); return -1; }
     while(offset < len){
+        // 对发送缓存实施背压；ACK 释放队首节点后由 send_cv 唤醒。
         while(in->tx_buffered >= TCP_RECVWN_SIZE && in->error == 0)
             pthread_cond_wait(&in->send_cv, &in->lock);
         if(in->error != 0 || in->send_closed){ pthread_mutex_unlock(&in->lock); return -1; }
@@ -856,6 +926,7 @@ int tju_send(tju_tcp_t* sock, const void* buffer, int len){
 }
 
 int tju_recv(tju_tcp_t* sock, void* buffer, int len){
+    // recv 是“短读”接口：有多少连续数据就取多少；收到 FIN 且无数据时返回 EOF=0。
     if(sock == NULL || sock->internal == NULL || buffer == NULL || len < 0) return -1;
     if(len == 0) return 0;
     tju_internal* in = sock->internal;
@@ -884,6 +955,7 @@ int tju_recv(tju_tcp_t* sock, void* buffer, int len){
 }
 
 static void enqueue_accepted_child(tju_internal* child){
+    // child 每次连接只入队一次；listener 的锁保护 FIFO 及 accept_cv。
     if(child->listener == NULL || child->accept_enqueued) return;
     tju_internal* listener = child->listener->internal;
     accept_node* node = calloc(1, sizeof(*node));
@@ -899,6 +971,7 @@ static void enqueue_accepted_child(tju_internal* child){
 }
 
 static void handle_listen_syn(tju_tcp_t* listener_sock, const char* pkt){
+    
     tju_internal* listener = listener_sock->internal;
     uint16_t remote_port = get_src((char*)pkt);
     uint32_t remote_seq = get_seq((char*)pkt);
@@ -931,6 +1004,7 @@ static void handle_listen_syn(tju_tcp_t* listener_sock, const char* pkt){
 }
 
 int tju_handle_packet_len(tju_tcp_t* sock, char* pkt, int packet_len){
+    // 单一收包状态机入口：先解析不可变头，再持连接锁处理 ACK、数据与 FIN。
     if(sock == NULL || sock->internal == NULL || !tju_validate_packet(pkt, packet_len)) return -1;
     uint16_t hlen = get_hlen(pkt), plen = get_plen(pkt);
     uint8_t flags = get_flags(pkt);
@@ -941,6 +1015,7 @@ int tju_handle_packet_len(tju_tcp_t* sock, char* pkt, int packet_len){
     pthread_mutex_lock(&in->lock);
     trace_event(in, "RECEIVE", seq, ack, false);
     if(sock->state == LISTEN){
+        // LISTEN 只接受不带 ACK 的 SYN；后续报文应由四元组命中 child。
         bool syn_only = (flags & SYN_FLAG_MASK) != 0 && (flags & ACK_FLAG_MASK) == 0;
         pthread_mutex_unlock(&in->lock);
         if(syn_only) handle_listen_syn(sock, pkt);
@@ -951,6 +1026,7 @@ int tju_handle_packet_len(tju_tcp_t* sock, char* pkt, int packet_len){
     if(in->peer_wnd != 0) in->persist_deadline_ns = 0;
 
     if(sock->state == SYN_SENT){
+        // SYN-ACK 必须精确确认 ISS+1，随后发送第三次握手 ACK。
         if((flags & (SYN_FLAG_MASK | ACK_FLAG_MASK)) == (SYN_FLAG_MASK | ACK_FLAG_MASK) &&
            ack == in->iss + 1U){
             acknowledge_locked(in, ack, false);
@@ -966,6 +1042,7 @@ int tju_handle_packet_len(tju_tcp_t* sock, char* pkt, int packet_len){
     }
 
     if(sock->state == SYN_RECV){
+        // 重复 SYN 触发 SYN-ACK 重发；合法第三 ACK 才把 child 放入 accept 队列。
         if((flags & SYN_FLAG_MASK) != 0 && in->tx_head != NULL){
             send_tx_node_locked(in, in->tx_head, true);
         }else if((flags & ACK_FLAG_MASK) != 0 && ack == in->iss + 1U){
@@ -980,6 +1057,7 @@ int tju_handle_packet_len(tju_tcp_t* sock, char* pkt, int packet_len){
         return 0;
     }
 
+    // 第三 ACK 丢失时，客户端收到重复 SYN-ACK 后需再次确认，服务端才能完成握手。
     if(sock->state == ESTABLISHED && (flags & (SYN_FLAG_MASK | ACK_FLAG_MASK)) ==
        (SYN_FLAG_MASK | ACK_FLAG_MASK) && seq == in->irs){
         send_ack_locked(in, "DUP_SYN_ACK_RESPONSE");
@@ -1004,12 +1082,14 @@ int tju_handle_packet_len(tju_tcp_t* sock, char* pkt, int packet_len){
     }
 
     if(data_len != 0){
+        // insert_rx_locked 自行去重/重组；无论是否推进，都回累计 ACK 告知当前空洞。
         insert_rx_locked(in, seq, pkt + hlen, data_len);
         consume_fin_if_ready_locked(in);
         send_ack_locked(in, "DATA_ACK");
     }
 
     if(flags & FIN_FLAG_MASK){
+        // FIN 位于 payload 之后并占一个序号；重复 FIN 在 TIME-WAIT 中刷新 2*MSL。
         uint32_t fin_seq = seq + data_len;
         if(seq_lt(fin_seq, in->rcv_nxt)){
             send_ack_locked(in, "DUP_FIN_ACK");
@@ -1030,11 +1110,13 @@ int tju_handle_packet_len(tju_tcp_t* sock, char* pkt, int packet_len){
 }
 
 int tju_handle_packet(tju_tcp_t* sock, char* pkt){
+    // 兼容入口无法验证实收长度；正常网络路径始终调用 _len 版本。
     if(pkt == NULL) return -1;
     return tju_handle_packet_len(sock, pkt, get_plen(pkt));
 }
 
 static void destroy_internal(tju_tcp_t* sock, tju_internal* in){
+    // 仅在 timer 已 join 且 dispatch_refs==0 后调用；外层 sock 故意保留为关闭句柄。
     tx_segment* tx = in->tx_head;
     while(tx != NULL){ tx_segment* next = tx->next; free_tx_node(tx); tx = next; }
     rx_segment* rx = in->rx_head;
@@ -1057,6 +1139,7 @@ static void destroy_internal(tju_tcp_t* sock, tju_internal* in){
 }
 
 int tju_close(tju_tcp_t* sock){
+    // close 先排空已提交数据，再把 FIN 排在其后，最后等待完整关闭状态机结束。
     if(sock == NULL || sock->internal == NULL) return -1;
     tju_internal* in = sock->internal;
     pthread_mutex_lock(&in->lock);

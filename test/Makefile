@@ -1,4 +1,5 @@
 BUILD_DIR = ../build
+# 课程测试程序与被测协议对象链接；不要把测试逻辑编进协议实现。
 OBJS = $(BUILD_DIR)/tju_packet.o \
 	   $(BUILD_DIR)/kernel.o \
 	   $(BUILD_DIR)/tju_tcp.o \

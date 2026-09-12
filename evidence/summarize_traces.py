@@ -1,5 +1,6 @@
 import csv, os
 
+# 将三组既定实验的原始 key=value trace 汇总成性能/可靠性 CSV。
 cases = [
     ("t7_noloss", 10485760, 20, 0, "evidence/t7_noloss_client.event.trace"),
     ("t7_loss5", 1048576, 20, 5, "evidence/t7_loss5_client.event.trace"),
@@ -14,6 +15,7 @@ for case, size, delay, loss, path in cases:
     def nums(key):
         return [float(r[key]) for r in rows if key in r and r[key] != "NA"]
     ts, flight, cwnd, rwnd = nums("timestamp_ns"), nums("flight"), nums("cwnd"), nums("rwnd")
+    # elapsed 取 trace 首尾事件跨度；goodput 使用应用有效字节，不含重传开销。
     elapsed = (max(ts) - min(ts)) / 1e9 if ts else 0
     events = [r.get("event", "") for r in rows]
     out.append({"case_id": case, "data_size_bytes": size, "delay_ms": delay,

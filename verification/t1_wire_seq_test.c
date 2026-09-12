@@ -3,11 +3,15 @@
 #include <assert.h>
 #include <stddef.h>
 
+/* 无网络单元测试：覆盖线格式、畸形长度、窗口饱和、序号回绕与 RTO 手算值。 */
+
 static double difference(double left, double right){
+    // 避免为简单浮点容差比较额外链接 libm。
     return left > right ? left - right : right - left;
 }
 
 static void put16(unsigned char* p, uint16_t value){
+    // 手工构造畸形/边界报文，不依赖被测 serializer。
     value = htons(value);
     memcpy(p, &value, sizeof(value));
 }
@@ -22,6 +26,7 @@ static void make_header(unsigned char* packet, size_t actual_len,
 }
 
 int main(void){
+    // 结构体含 padding 是预期现象；真正的 wire header 仍必须严格为 20 bytes。
     assert(DEFAULT_HEADER_LEN == 20);
     assert(MAX_LEN == 1400);
     assert(MAX_DLEN == 1380);
@@ -43,6 +48,7 @@ int main(void){
     assert(tju_validate_packet(wire, 21));
     free(wire);
 
+    // 19/20/21/1400/1401 及声明长度不一致覆盖接收入口关键边界。
     unsigned char packet[1401];
     make_header(packet, 20, 20, 20);
     assert(tju_validate_packet((char*)packet, 20));
@@ -74,6 +80,7 @@ int main(void){
     assert(tju_seq_after(1, 0xfffffffeU));
     assert(!tju_seq_before(0x7fffffffU, 0x7fffffffU));
 
+    // 用可手算样本验证 RFC 6298 更新次序和 1 秒下限。
     int have_sample = 0;
     double srtt = 0.0, rttvar = 0.0, rto = 1.0;
     tju_rto_update_values(&have_sample, &srtt, &rttvar, &rto, 0.100);

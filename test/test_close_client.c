@@ -2,6 +2,7 @@
 #include <string.h>
 #include <signal.h>
 
+/* 主动关闭测试客户端：握手后调用 tju_close，观察 FIN/ACK 与最终状态。 */
 void fflushbeforeexit(int signo){
     exit(0);
 }

@@ -1,12 +1,15 @@
 #ifndef _KERNEL_H_
 #define _KERNEL_H_
 
+/* UDP 承载适配层：维护监听/已连接 socket 表，并在协议层与 UDP 之间分发报文。 */
+
 #include "global.h"
 #include "tju_packet.h"
 #include <unistd.h>
 #include "tju_tcp.h"
 
 #define MAX_SOCK 32
+// 教学框架使用固定大小的直接映射表；它不是 Linux 内核真正的哈希链表。
 extern tju_tcp_t* listen_socks[MAX_SOCK];
 extern tju_tcp_t* established_socks[MAX_SOCK];
 
@@ -14,6 +17,7 @@ extern tju_tcp_t* established_socks[MAX_SOCK];
 模拟Linux内核收到一份TCP报文的处理函数
 */
 void onTCPPocket(char* pkt);
+// 长度感知入口可在读取任何字段后续内容前拒绝短包、截断包和超长包。
 void onTCPPocketWithLen(char* pkt, int packet_len);
 
 
@@ -49,6 +53,7 @@ extern int BACKEND_UDPSOCKET_ID;
   不过由于本项目是TCP 协议都一样, 就没必要了)
 */
 int cal_hash(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port);
+// 注册/删除操作由 kernel.c 的表锁串行化；返回 -1 表示槽位冲突。
 int kernel_register_listener(tju_tcp_t* sock);
 int kernel_register_connection(tju_tcp_t* sock);
 void kernel_remove_listener(tju_tcp_t* sock);

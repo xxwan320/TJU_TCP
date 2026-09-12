@@ -2,6 +2,7 @@
 
 #define TEST_BYTES (8U * 1024U * 1024U)
 
+/* 延迟读取让接收缓存耗尽，再读空缓存验证 WINDOW_UPDATE 是否恢复发送。 */
 int main(void){
     startSimulation();
     tju_tcp_t* listener = tju_socket();

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 用 AddressSanitizer/UBSan 构建端到端文件收发程序；运行步骤由配套脚本负责。
 set -o pipefail
 cd /vagrant/tju_tcp || exit 1
 flags='-pthread -g -ggdb -DDEBUG -I./inc -fsanitize=address,undefined -fno-omit-frame-pointer'

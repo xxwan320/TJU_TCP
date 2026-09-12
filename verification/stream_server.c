@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 
+/* 通用文件接收端：读到 FIN/EOF 后落盘，外部用大小和 SHA-256 判断可靠性。 */
 int main(int argc, char** argv){
     if(argc != 2) return 2;
     int fd = open(argv[1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -17,6 +18,7 @@ int main(int argc, char** argv){
     int count;
     while((count = tju_recv(sock, buffer, sizeof(buffer))) > 0){
         int offset = 0;
+        // POSIX write 允许短写，必须循环写完本次 tju_recv 返回的数据。
         while(offset < count){
             ssize_t written = write(fd, buffer + offset, (size_t)(count - offset));
             if(written <= 0) return 7;

@@ -1,5 +1,6 @@
 #include "tju_packet.h"
 
+/* 固定偏移的序列化/解析层；所有多字节整数在线上使用网络字节序（大端）。 */
 
 /*
  输入header所有字段 和 TCP包数据内容及其长度
@@ -10,6 +11,7 @@ tju_packet_t* create_packet(uint16_t src, uint16_t dst, uint32_t seq,
     uint32_t ack, uint16_t hlen, uint16_t plen, uint8_t flags, 
     uint16_t adv_window, uint8_t ext, char* data, int len){
 
+    // packet 对 data 做深拷贝，因此调用者随后可以释放自己的发送缓冲区。
     tju_packet_t* new = malloc(sizeof(tju_packet_t));
 
     new->header.source_port = src;
@@ -44,6 +46,7 @@ char* create_packet_buf(uint16_t src, uint16_t dst, uint32_t seq, uint32_t ack,
     tju_packet_t* temp;
     char* final;  
 
+    // 临时对象仅用于复用构造逻辑；返回的 wire buffer 所有权交给调用者。
     temp = create_packet(src, dst, seq, ack, hlen, plen, flags, adv_window, 
         ext, data, len);
 
@@ -70,6 +73,7 @@ void free_packet(tju_packet_t* packet){
 */ 
 
 uint16_t get_src(char* msg){
+    // 下列 getter 的偏移共同定义了真正的 20-byte wire ABI。
     int offset = 0;
     uint16_t var;
     memcpy(&var, msg+offset, SIZE16);
@@ -126,8 +130,6 @@ uint8_t get_ext(char* msg){
 
 
 
-/*############################################## 下面是实现上面函数功能的辅助函数 用户没必要调用 ##############################################*/
-
 
 /*
  传入header所需的各种数据
@@ -140,6 +142,7 @@ char* header_in_char(uint16_t src, uint16_t dst, uint32_t seq, uint32_t ack,
 	uint16_t temp16;
     uint32_t temp32;
     
+    // 按 plen 一次分配完整报文，calloc 同时把尚未填充的数据区清零。
     char* msg = (char*) calloc(plen, sizeof(char));
     int index = 0;
     
@@ -191,6 +194,7 @@ char* packet_to_buf(tju_packet_t* p){
         p->header.flags, p->header.advertised_window, 
         p->header.ext);
     
+    // payload 紧跟 hlen；当前协议要求 hlen 固定为 DEFAULT_HEADER_LEN。
     if(p->header.plen > p->header.hlen){
         memcpy(msg+(p->header.hlen), p->data, (p->header.plen - (p->header.hlen)));
     }

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 对无需双 VM 的 wire/序号/RTO 边界测试同时启用 ASan 与 UBSan。
 set -o pipefail
 cd /vagrant/tju_tcp || exit 1
 flags='-pthread -g -ggdb -DDEBUG -I./inc -fsanitize=address,undefined -fno-omit-frame-pointer'

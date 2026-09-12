@@ -1,6 +1,7 @@
 #include "tju_tcp.h"
 #include <string.h>
 
+/* 连接建立测试服务端：tju_accept 必须阻塞到 child 完成三次握手。 */
 int main(int argc, char **argv) { 
     startSimulation();
 

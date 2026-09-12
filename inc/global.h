@@ -1,6 +1,14 @@
 #ifndef _GLOBAL_H_
 #define _GLOBAL_H_
 
+/*
+ * TJU_TCP 的公共类型和容量常量。
+ *
+ * 这是教学协议而不是操作系统 TCP：上层仍使用 socket 风格接口，但报文最终
+ * 由 kernel.c 封装在 UDP 数据报中传输。协议的复杂状态放在 tju_tcp_t.internal
+ * 指向的私有连接控制块里，避免把实现细节暴露给应用和课程测试。
+ */
+
 #include <netinet/in.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -15,7 +23,7 @@
 #include <sys/select.h>
 #include <arpa/inet.h>
 
-// 单位是byte
+// 线格式字段宽度，单位是 byte；不要用 sizeof(tju_header_t) 代替固定偏移。
 #define SIZE32 4
 #define SIZE16 2
 #define SIZE8  1
@@ -27,7 +35,7 @@
 #define TRUE 1
 #define FALSE 0
 
-// 定义最大包长 防止IP层分片
+// 单个 TJU 报文限制为 1400 byte：20 byte 固定头 + 至多 1380 byte 数据。
 #define MAX_DLEN 1380 	// 1400-byte packet minus the fixed 20-byte wire header
 #define MAX_LEN 1400 	// 最大包长度
 
@@ -49,11 +57,10 @@
 #define CONGESTION_AVOIDANCE 1
 #define FAST_RECOVERY 2
 
-// TCP 接受窗口大小
+// 内部接收缓存约 6.9 MB；线上的 advertised_window 只有 16 bit，需饱和编码。
 #define TCP_RECVWN_SIZE (5000*MAX_DLEN)
 
-// TCP 发送窗口
-// 注释的内容如果想用就可以用 不想用就删掉 仅仅提供思路和灵感
+// 模板保留的公开发送窗口外壳；真正的滑动窗口状态位于私有连接控制块。
 typedef struct {
 	uint16_t window_size;
 
@@ -70,8 +77,7 @@ typedef struct {
 //   uint16_t ssthresh; 
 } sender_window_t;
 
-// TCP 接受窗口
-// 注释的内容如果想用就可以用 不想用就删掉 仅仅提供思路和灵感
+// 模板保留的公开接收窗口外壳；当前数据实际存入私有环形缓冲区。
 typedef struct {
 	char received[TCP_RECVWN_SIZE];
 
@@ -112,7 +118,7 @@ typedef struct {
 	pthread_cond_t wait_cond; // 可以被用来唤醒recv函数调用时等待的线程
 
 	window_t window; // 发送和接受窗口
-	void* internal; // protocol-private connection state
+	void* internal; // 不透明的私有连接控制块；由 tju_socket 创建、tju_close 回收
 
 } tju_tcp_t;
 

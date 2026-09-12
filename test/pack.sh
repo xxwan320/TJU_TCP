@@ -1,4 +1,5 @@
 #!/bin/bash
+# 课程提交打包器：清除二进制后仅打包 src/inc/build 和根 Makefile。
 pack_tju_tcp(){
     echo '正在打包 打包会运行make clean指令清除所有编译结果'
     echo ''
@@ -10,6 +11,7 @@ pack_tju_tcp(){
 }
 
 
+# 缺少 zip 时安装依赖；此脚本会修改系统软件包并生成 handin.zip。
 if command -v zip; then 
     pack_tju_tcp
 else 
