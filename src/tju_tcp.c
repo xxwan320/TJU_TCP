@@ -15,15 +15,13 @@
  *（下一入队序号）；接收侧仅把从 RCV.NXT 开始连续的数据交付给应用。
  */
 
-// 计时参数集中定义。20 ms loss probe 和 0.7 快速丢包退让属于本实现扩展。
+// 计时参数集中定义。20 ms loss probe 属于本实现扩展。
 #define NSEC_PER_SEC 1000000000ULL
 #define INITIAL_RTO_NS NSEC_PER_SEC
 #define MIN_RTO_NS NSEC_PER_SEC
 #define MAX_RTO_NS (60ULL * NSEC_PER_SEC)
 #define LOSS_PROBE_NS (20ULL * 1000ULL * 1000ULL)
 #define MAX_LOSS_PROBES 3U
-#define FAST_LOSS_BETA_NUM 7U
-#define FAST_LOSS_BETA_DEN 10U
 #define HANDSHAKE_RESET_RTO_NS (3ULL * NSEC_PER_SEC)
 #define TJU_MAX_RETRIES 5U
 #define TJU_MSL_SECONDS 5U
@@ -122,6 +120,7 @@ typedef struct tju_internal {
     // RTT/RTO 遵循平滑估计；重传歧义由 retransmitted 标记实现 Karn 规则。
     uint32_t dup_ack;
     unsigned dup_ack_count;
+    uint64_t limited_transmit_bytes;
     bool have_rtt;
     bool last_sample_valid;
     double last_sample_rtt;
@@ -388,6 +387,9 @@ static void flush_send_locked(tju_internal* in){
         if(node->sent) continue;
         bool control = (node->flags & (SYN_FLAG_MASK | FIN_FLAG_MASK)) != 0;
         if(!control && (in->peer_wnd == 0 || seq_gt(node->end, right_edge))) break;
+        if(!control && !in->fast_recovery_pending &&
+           in->dup_ack_count > 0 && in->dup_ack_count < 3)
+            in->limited_transmit_bytes += node->len;
         send_tx_node_locked(in, node, false);
     }
     // 零窗口不能依赖普通重传解决：启动 persist，主动询问窗口是否已重开。
@@ -464,9 +466,10 @@ static bool acknowledge_locked(tju_internal* in, uint32_t ack, bool eligible_dup
             else { in->dup_ack = ack; in->dup_ack_count = 1; }
             if(in->dup_ack_count == 3){
                 uint64_t flight = in->snd_nxt - in->snd_una;
-                /* Use CUBIC's 0.7 multiplicative decrease for losses found by
-                 * duplicate ACKs.  An RTO still performs Reno's 0.5 decrease. */
-                in->ssthresh = flight * FAST_LOSS_BETA_NUM / FAST_LOSS_BETA_DEN;
+                /* RFC 5681 section 3.2: halve FlightSize on the third dupACK. */
+                uint64_t loss_flight = flight > in->limited_transmit_bytes ?
+                                       flight - in->limited_transmit_bytes : 0;
+                in->ssthresh = loss_flight / 2U;
                 if(in->ssthresh < 2U * MAX_DLEN) in->ssthresh = 2U * MAX_DLEN;
                 in->cwnd = in->ssthresh + 3U * MAX_DLEN;
                 in->reno = RENO_FAST_RECOVERY;
@@ -512,6 +515,7 @@ static bool acknowledge_locked(tju_internal* in, uint32_t ack, bool eligible_dup
     in->loss_probe_count = 0;
     in->dup_ack = ack;
     in->dup_ack_count = 0;
+    in->limited_transmit_bytes = 0;
     // partial ACK 在恢复点之前时继续重传下一个洞；越过恢复点才退出恢复。
     if(in->timeout_recovery_pending){
         if(seq_lt(ack, in->recovery_point) && in->tx_head != NULL && in->tx_head->sent){
@@ -523,12 +527,8 @@ static bool acknowledge_locked(tju_internal* in, uint32_t ack, bool eligible_dup
             reno_ack_locked(in, acknowledged_payload);
         }
     }else if(in->fast_recovery_pending){
-        if(seq_lt(ack, in->recovery_point) && in->tx_head != NULL){
-            in->cwnd = in->ssthresh + 3U * MAX_DLEN;
-            in->reno = RENO_FAST_RECOVERY;
-            send_tx_node_locked(in, in->tx_head, true);
-            trace_event(in, "FAST_RETRANSMIT", in->tx_head->seq, ack, true);
-        }else{
+        /* Classic Reno deflates on the first ACK acknowledging new data. */
+        {
             in->cwnd = in->ssthresh;
             in->reno = RENO_CONGESTION_AVOIDANCE;
             in->fast_recovery_pending = false;
@@ -748,6 +748,7 @@ static void* timer_main(void* argument){
                 in->ca_accumulator = 0;
                 in->dup_ack = in->snd_una;
                 in->dup_ack_count = 0;
+                in->limited_transmit_bytes = 0;
             }
             send_tx_node_locked(in, node, true);
             if(in->rto_ns < MAX_RTO_NS / 2) in->rto_ns *= 2;
@@ -1022,6 +1023,7 @@ int tju_handle_packet_len(tju_tcp_t* sock, char* pkt, int packet_len){
         return syn_only ? 0 : -1;
     }
 
+    uint32_t previous_peer_wnd = in->peer_wnd;
     in->peer_wnd = get_advertised_window(pkt);
     if(in->peer_wnd != 0) in->persist_deadline_ns = 0;
 
@@ -1068,7 +1070,8 @@ int tju_handle_packet_len(tju_tcp_t* sock, char* pkt, int packet_len){
     bool ack_advanced = false;
     if(flags & ACK_FLAG_MASK)
         ack_advanced = acknowledge_locked(in, ack,
-                                          data_len == 0 && (flags & (SYN_FLAG_MASK | FIN_FLAG_MASK)) == 0);
+                                          data_len == 0 && previous_peer_wnd == in->peer_wnd &&
+                                          (flags & (SYN_FLAG_MASK | FIN_FLAG_MASK)) == 0);
 
     if(ack_advanced){
         if(sock->state == FIN_WAIT_1){
